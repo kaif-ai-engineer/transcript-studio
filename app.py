@@ -195,6 +195,11 @@ with st.sidebar:
             "Provide a free YouTube Data API v3 key to fetch playlist metadata through "
             "the official API instead of yt-dlp."
         )
+        if not st.session_state.api_key:
+            try:
+                st.session_state.api_key = st.secrets.get("youtube_api_key", "") or ""
+            except Exception:  # noqa: BLE001 — secrets may be absent entirely
+                pass
         st.session_state.api_key = st.text_input(
             "YouTube Data API v3 key",
             value=st.session_state.api_key,
