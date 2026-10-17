@@ -1,6 +1,7 @@
 """Streamlit web interface for the YouTube Playlist Transcript & Study Notes tool."""
 
 import threading
+from pathlib import Path
 from typing import List, Optional, Set
 
 import streamlit as st
@@ -14,7 +15,7 @@ from yt_tool.playlist import (
 )
 from yt_tool.transcript import TranscriptFetcher
 from yt_tool.cache import TranscriptCache
-from yt_tool.network import NetworkManager, CircuitBreaker
+from yt_tool.network import NetworkManager, CircuitBreaker, write_netscape_cookies
 from yt_tool.processor import JobManager
 from yt_tool.formatter import (
     format_combined_markdown,
@@ -174,18 +175,20 @@ with st.sidebar:
     )
 
     st.divider()
-    with st.expander("Authentication (recommended)", expanded=False):
+    with st.expander("About rate limits", expanded=False):
+        st.markdown(
+            "YouTube rate-limits (HTTP 429) by **IP address**. A shared hosting server's IP "
+            "is throttled far more aggressively than a home connection.\n\n"
+            "**If you see 429s:**\n"
+            "- Wait a few minutes and press *Retry failed*.\n"
+            "- Lower **Parallel workers** to 1 and raise the delay.\n"
+            "- For bulk playlists, run the app locally — your own connection is much less throttled."
+        )
         st.caption(
-            "Pasting your YouTube browser cookies is the most reliable way to avoid "
-            "rate limits. Cookies stay in this session only."
+            "Hosting a public instance? Provide cookies server-side via Streamlit secrets "
+            "(`youtube_cookies = \"...\"`) to reduce throttling. Never ask users to paste "
+            "their personal YouTube cookies into a public app."
         )
-        cookie_input = st.text_area(
-            "Cookie string",
-            placeholder="VISITOR_INFO1_LIVE=...; CONSENT=...;",
-            height=90,
-            label_visibility="collapsed",
-        )
-        st.caption("Optional. Exporting `cookies.txt` from a browser extension also works locally.")
 
     with st.expander("Metadata API key (optional)", expanded=False):
         st.caption(
@@ -358,13 +361,20 @@ if playlist:
         if retry_btn:
             selected_ids = failed_ids or selected_ids
 
-        network_manager = NetworkManager(
-            cookie_string=cookie_input if cookie_input.strip() else None,
-            circuit_breaker=st.session_state.circuit_breaker,
-        )
+        network_manager = NetworkManager(circuit_breaker=st.session_state.circuit_breaker)
+
+        cookie_file = None
+        try:
+            secret_cookies = st.secrets.get("youtube_cookies")
+        except Exception:  # noqa: BLE001 — secrets may be absent entirely
+            secret_cookies = None
+        if secret_cookies:
+            cookie_file = str(write_netscape_cookies(secret_cookies, Path("data/.cookies.txt")))
+
         fetcher = TranscriptFetcher(
             network_manager=network_manager,
             allow_translation=allow_auto_translate,
+            cookie_file=cookie_file,
         )
         manager = JobManager(fetcher=fetcher, cache=cache, network_manager=network_manager)
 
@@ -381,7 +391,12 @@ if playlist:
                 m2.metric("Successful", prog.successful)
                 m3.metric("Failed", prog.failed)
                 m4.metric("Elapsed", f"{prog.elapsed_seconds:.0f}s")
-            if item:
+            if prog.rate_limited:
+                status_ph.error(
+                    "YouTube is rate-limiting this server's IP. Stopped remaining videos. "
+                    "Wait a few minutes and use **Retry failed**, or run the app locally."
+                )
+            elif item:
                 if item.is_successful():
                     status_ph.success(f"Saved: {item.title}")
                 else:

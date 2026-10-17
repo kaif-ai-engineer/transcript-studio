@@ -25,6 +25,12 @@ class AppConfig:
     max_retries: int = 5
     initial_backoff_seconds: float = 2.5
     backoff_factor: float = 1.8
+
+    # Rate-limit handling. When YouTube returns HTTP 429 it is tied to the
+    # requesting IP, so retrying harder does not help — we fail fast and pause.
+    rate_limit_attempts: int = 2          # API attempt + yt-dlp fallback attempt
+    rate_limit_cooldown_seconds: float = 30.0
+    abort_job_after_rate_limits: int = 3  # consecutive rate-limited videos before stopping
     
     # Supported default language preferences: English 1st, Hindi 2nd
     default_languages: List[str] = field(default_factory=lambda: ["en", "hi"])

@@ -92,6 +92,7 @@ class VideoTranscript:
     segments: List[TranscriptSegment] = field(default_factory=list)
     full_text: str = ""
     error_reason: Optional[str] = None
+    error_code: Optional[str] = None  # e.g. "rate_limited", "captions_disabled"
     retrieved_at: Optional[str] = None
 
     def __post_init__(self):
@@ -116,6 +117,7 @@ class VideoTranscript:
             "segments": [s.to_dict() for s in self.segments],
             "full_text": self.full_text,
             "error_reason": self.error_reason,
+            "error_code": self.error_code,
             "retrieved_at": self.retrieved_at or datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
 
@@ -134,6 +136,7 @@ class VideoTranscript:
             segments=segments,
             full_text=data.get("full_text", ""),
             error_reason=data.get("error_reason"),
+            error_code=data.get("error_code"),
             retrieved_at=data.get("retrieved_at"),
         )
 
@@ -151,6 +154,7 @@ class JobProgress:
     elapsed_seconds: float = 0.0
     is_running: bool = False
     is_cancelled: bool = False
+    rate_limited: bool = False
     logs: List[str] = field(default_factory=list)
 
     @property

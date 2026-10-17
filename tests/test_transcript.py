@@ -15,7 +15,7 @@ from yt_tool.transcript import (
     compile_full_text,
     TranscriptFetcher,
 )
-from yt_tool.models import VideoMetadata, TranscriptSegment
+from yt_tool.models import VideoMetadata, TranscriptSegment, VideoTranscript
 
 
 def test_format_timestamp():
@@ -276,8 +276,8 @@ def test_fetch_transient_error_exhaust_retries(mocker):
     assert mock_api.list.call_count == 3  # initial + 2 retries
 
 
-def test_fetch_rate_limit_pauses_then_fails_with_guidance(mocker):
-    """Verify rate limiting trips the shared cooldown and fails with actionable guidance."""
+def test_fetch_rate_limit_fails_fast_and_trips_breaker(mocker):
+    """A 429 must trip the shared cooldown and fail immediately (no long retry spiral)."""
     from youtube_transcript_api import IpBlocked
     from yt_tool.network import NetworkManager, CircuitBreaker
 
@@ -294,54 +294,155 @@ def test_fetch_rate_limit_pauses_then_fails_with_guidance(mocker):
     cb = CircuitBreaker(default_cooldown=30.0)
     nm = NetworkManager(circuit_breaker=cb)
     mocker.patch.object(nm, "create_transcript_api", return_value=mock_api)
-    # Avoid real waiting inside the cooldown loop during unit tests.
     mocker.patch.object(CircuitBreaker, "wait_if_tripped", return_value=True)
     mocker.patch("time.sleep")
 
-    fetcher = TranscriptFetcher(max_retries=2, initial_backoff=0.5, network_manager=nm)
+    fetcher = TranscriptFetcher(network_manager=nm, use_ytdlp_fallback=False)
     result = fetcher.fetch_video_transcript(video, ["en"])
 
     assert not result.is_successful()
-    assert "rate-limited" in result.error_reason.lower()
-    # Initial attempt + 2 retries.
-    assert mock_api.list.call_count == 3
-    # The shared circuit breaker must have been tripped.
+    assert result.error_code == "rate_limited"
+    assert "rate-limiting" in result.error_reason.lower()
+    # Fail fast: exactly one API attempt, no retry storm.
+    assert mock_api.list.call_count == 1
     assert cb.is_tripped
 
 
-def test_fetch_rate_limit_recovers_after_cooldown(mocker):
-    """Verify a video blocked once still succeeds on the next attempt."""
+def test_fetch_rate_limit_uses_ytdlp_fallback(mocker):
+    """When the API is blocked, a successful yt-dlp fallback still yields a transcript."""
+    from youtube_transcript_api import IpBlocked
+    from yt_tool.network import NetworkManager
+
+    video = VideoMetadata(
+        video_id="vid_fallback",
+        title="Fallback Video",
+        url="https://www.youtube.com/watch?v=vid_fallback",
+        playlist_index=8,
+    )
+
+    mock_api = mocker.MagicMock()
+    mock_api.list.side_effect = IpBlocked(video.video_id)
+
+    nm = NetworkManager()
+    mocker.patch.object(nm, "create_transcript_api", return_value=mock_api)
+    mocker.patch("time.sleep")
+
+    fallback_result = VideoTranscript(
+        video_id=video.video_id,
+        title=video.title,
+        url=video.url,
+        playlist_index=video.playlist_index,
+        status="success",
+        language="en (auto-generated)",
+        language_code="en",
+        is_generated=True,
+        segments=[TranscriptSegment(text="From the fallback path.", start=0.0, duration=2.0)],
+        full_text="From the fallback path.",
+    )
+
+    fetcher = TranscriptFetcher(network_manager=nm)
+    mocker.patch.object(fetcher, "fetch_via_ytdlp", return_value=fallback_result)
+
+    result = fetcher.fetch_video_transcript(video, ["en"])
+    assert result.is_successful()
+    assert result.full_text == "From the fallback path."
+
+
+def test_fetch_rate_limit_fails_when_fallback_also_blocked(mocker):
+    """If both the API and the yt-dlp fallback are rate limited, fail fast as rate_limited."""
     from youtube_transcript_api import IpBlocked
     from yt_tool.network import NetworkManager, CircuitBreaker
 
     video = VideoMetadata(
-        video_id="vid_ip_recover",
-        title="Recovered Video",
-        url="https://www.youtube.com/watch?v=vid_ip_recover",
-        playlist_index=8,
+        video_id="vid_both_blocked",
+        title="Both Blocked",
+        url="https://www.youtube.com/watch?v=vid_both_blocked",
+        playlist_index=9,
     )
 
-    mock_transcript_obj = mocker.MagicMock()
-    mock_transcript_obj.language = "English"
-    mock_transcript_obj.language_code = "en"
-    mock_transcript_obj.is_generated = False
-    mock_fetched = mocker.MagicMock()
-    mock_fetched.to_raw_data.return_value = [{"text": "Recovered after pause.", "start": 0.0, "duration": 2.0}]
-    mock_transcript_obj.fetch.return_value = mock_fetched
-
     mock_api = mocker.MagicMock()
-    mock_api.list.side_effect = [IpBlocked(video.video_id), [mock_transcript_obj]]
+    mock_api.list.side_effect = IpBlocked(video.video_id)
 
-    nm = NetworkManager(circuit_breaker=CircuitBreaker(default_cooldown=0.0))
+    cb = CircuitBreaker(default_cooldown=30.0)
+    nm = NetworkManager(circuit_breaker=cb)
     mocker.patch.object(nm, "create_transcript_api", return_value=mock_api)
-    mocker.patch.object(CircuitBreaker, "wait_if_tripped", return_value=True)
     mocker.patch("time.sleep")
 
-    fetcher = TranscriptFetcher(max_retries=3, initial_backoff=0.01, network_manager=nm)
-    result = fetcher.fetch_video_transcript(video, ["en"])
+    fetcher = TranscriptFetcher(network_manager=nm)
+    mocker.patch.object(fetcher, "fetch_via_ytdlp", side_effect=lambda v, langs: fetcher._rate_limited_result(v))
 
-    assert result.is_successful()
-    assert result.full_text == "Recovered after pause."
-    assert mock_api.list.call_count == 2
+    result = fetcher.fetch_video_transcript(video, ["en"])
+    assert result.error_code == "rate_limited"
+    assert cb.is_tripped
+
+
+def test_parse_json3_captions():
+    """json3 caption payloads are converted to timed segments."""
+    from yt_tool.transcript import parse_json3_captions
+
+    payload = {
+        "events": [
+            {"tStartMs": 0, "dDurationMs": 4000, "segs": [{"utf8": "Hello "}, {"utf8": "world &amp; all"}]},
+            {"tStartMs": 4500, "dDurationMs": 3000, "segs": [{"utf8": "Second line."}]},
+            {"tStartMs": 8000, "dDurationMs": 1000, "segs": [{"utf8": "\n"}]},
+        ]
+    }
+    segs = parse_json3_captions(payload)
+    assert len(segs) == 2
+    assert segs[0].text == "Hello world & all"
+    assert segs[0].start == 0.0
+    assert segs[1].start == 4.5
+
+
+def test_parse_vtt_captions():
+    """WebVTT documents are parsed into timed segments."""
+    from yt_tool.transcript import parse_vtt_captions
+
+    vtt = (
+        "WEBVTT\n\n"
+        "00:00:00.000 --> 00:00:04.000\nHello there\n\n"
+        "00:00:04.500 --> 00:00:07.000\nGeneral &amp; Kenobi\n"
+    )
+    segs = parse_vtt_captions(vtt)
+    assert len(segs) == 2
+    assert segs[0].text == "Hello there"
+    assert segs[0].duration == 4.0
+    assert segs[1].text == "General & Kenobi"
+    assert segs[1].start == 4.5
+
+
+def test_choose_caption_track_prefers_manual_then_language():
+    """Track selection respects manual-vs-auto and language priority."""
+    from yt_tool.transcript import choose_caption_track
+
+    manual = {"en": [{"ext": "json3", "url": "m-en"}]}
+    auto = {"en": [{"ext": "json3", "url": "a-en"}], "hi": [{"ext": "vtt", "url": "a-hi"}]}
+
+    lang, tracks, gen = choose_caption_track(manual, auto, ["en", "hi"])
+    assert lang == "en" and gen is False and tracks[0]["url"] == "m-en"
+
+    lang, tracks, gen = choose_caption_track({}, auto, ["en", "hi"])
+    assert lang == "en" and gen is True
+
+    lang, tracks, gen = choose_caption_track({}, auto, ["hi"])
+    assert lang == "hi"
+
+    lang, tracks, gen = choose_caption_track({}, {}, ["en"])
+    assert lang is None and tracks is None and gen is None
+
+
+def test_pick_caption_url_prefers_json3():
+    """json3 is preferred over VTT/SRV formats."""
+    from yt_tool.transcript import pick_caption_url
+
+    url, ext = pick_caption_url([{"ext": "vtt", "url": "v"}, {"ext": "json3", "url": "j"}])
+    assert (url, ext) == ("j", "json3")
+
+    url, ext = pick_caption_url([{"ext": "vtt", "url": "v"}])
+    assert (url, ext) == ("v", "vtt")
+
+    url, ext = pick_caption_url([])
+    assert url is None and ext is None
+
 
 

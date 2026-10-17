@@ -72,7 +72,6 @@ Then open http://localhost:8501
    - Caption language priority (English/Hindi/auto/custom).
    - Parallel workers — keep **1–2** for reliability.
    - Request delay — a short pause avoids rate limits.
-   - Cookies (optional but strongly recommended for large playlists).
 4. **Get transcripts** and watch live progress. You can stop at any time.
 5. **Export** — download the `.md` handbook, `.txt`, or the full `.zip`.
 
@@ -84,7 +83,7 @@ Then open http://localhost:8501
 | --- | --- | --- |
 | Caption language | Sidebar | Priority order for transcript selection. |
 | Workers / delay | Sidebar | Lower = more polite and more reliable. |
-| Cookie string | Sidebar → Authentication | Your YouTube `Cookie:` header. Stays in the session only. |
+| Cookie file | Streamlit secrets (`youtube_cookies`) | Server-side only. Never paste personal cookies into a public app. |
 | API key | Sidebar → Metadata API key | Optional official YouTube Data API v3 key. |
 | `YOUTUBE_API_KEY` | Environment / `.streamlit/secrets.toml` | Same key, applied automatically. |
 
@@ -127,22 +126,32 @@ yt-tool/
 
 ## 🛡️ Rate limits & troubleshooting
 
-YouTube throttles anonymous IPs that request captions too fast. The tool mitigates this by:
+YouTube throttles requests by **IP address**. The tool handles this by:
 
 - Defaulting to **2 workers** with a **0.8s** delay between requests.
-- Tripping a **shared circuit breaker** that pauses *every* worker when a 429 arrives, then resuming automatically.
-- **Exponential backoff** on transient errors.
+- **Failing fast** on HTTP 429: it tries one alternate source (yt-dlp's caption
+  tracks, which use different YouTube clients), then pauses and stops the job
+  instead of retrying a doomed request for minutes.
+- **Aborting the whole job** after a few consecutive rate-limited videos, so you
+  get a clear message rather than 100 failed entries.
 - **Disk caching** — already-fetched videos never hit the network again.
 
-If you still hit rate limits on a very large playlist:
+> **The single most important thing to know:** shared hosting (including
+> Streamlit Community Cloud) runs on datacenter IPs that YouTube throttles hard.
+> A **home connection is dramatically less throttled**. If you're pulling large
+> playlists, run the app locally — it's the reliable path.
 
-1. Paste your **browser cookies** (Sidebar → Authentication). This is the single most effective fix.
-2. Drop workers to **1** and increase the delay.
-3. Wait a few minutes — retry only fetches the videos that are still missing.
+If you still hit 429s:
 
-**Note:** proxy rotation and IP-hopping were deliberately removed. They bypass YouTube's
-access controls (violating its Terms of Service), are unreliable in practice, and add
-unnecessary legal risk. See below.
+1. Wait a few minutes and press **Retry failed** (only missing videos are fetched).
+2. Drop workers to **1** and raise the delay.
+3. Server operators can set `youtube_cookies` in Streamlit secrets to authenticate
+   requests server-side. **Do not** ask end users to paste their personal cookies
+   into a public app.
+
+**Note:** proxy rotation and IP-hopping were deliberately removed. They bypass
+YouTube's access controls (violating its Terms of Service), are unreliable in
+practice, and add unnecessary legal risk. See below.
 
 ---
 

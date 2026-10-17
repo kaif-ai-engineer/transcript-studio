@@ -137,3 +137,57 @@ def test_processor_graceful_cancellation(mock_cache: TranscriptCache, sample_pla
     # No network requests should have been made
     assert mock_fetcher.fetch_video_transcript.call_count == 0
     assert len(results) == 3
+
+
+def test_processor_aborts_job_after_repeated_rate_limits(mock_cache: TranscriptCache):
+    """Requirement: Stop the job once YouTube persistently rate-limits, instead of grinding."""
+    videos = [
+        VideoMetadata(
+            video_id=f"rl_{i}",
+            title=f"Video {i}",
+            url=f"https://www.youtube.com/watch?v=rl_{i}",
+            playlist_index=i,
+        )
+        for i in range(1, 7)  # 6 videos, threshold is 3
+    ]
+    playlist = PlaylistMetadata(
+        playlist_id="PLratelimit",
+        title="Rate Limited Playlist",
+        url="https://www.youtube.com/playlist?list=PLratelimit",
+        total_count=6,
+        videos=videos,
+    )
+
+    mock_fetcher = MagicMock(spec=TranscriptFetcher)
+
+    def side_effect(video, preferred_languages=None, stop_event=None):
+        return VideoTranscript(
+            video_id=video.video_id,
+            title=video.title,
+            url=video.url,
+            playlist_index=video.playlist_index,
+            status="failed",
+            error_code="rate_limited",
+            error_reason="Rate limited",
+        )
+
+    mock_fetcher.fetch_video_transcript.side_effect = side_effect
+    manager = JobManager(fetcher=mock_fetcher, cache=mock_cache)
+
+    seen = {}
+
+    def callback(prog, item):
+        seen["rate_limited"] = prog.rate_limited
+
+    results = manager.run_job(
+        playlist=playlist,
+        concurrency=1,
+        request_delay=0.01,
+        progress_callback=callback,
+    )
+
+    assert seen.get("rate_limited") is True
+    # Job should stop early rather than process all six.
+    assert mock_fetcher.fetch_video_transcript.call_count < 6
+    assert len(results) == 6  # results always align with the full playlist
+

@@ -1,14 +1,17 @@
 """Transcript retrieval, normalization, translation, and language resolution."""
 
 from __future__ import annotations
+
+import datetime
 import html
+import logging
 import random
 import re
 import time
-import logging
-from typing import List, Optional, Tuple, Iterable, Set
-import datetime
+from typing import Iterable, List, Optional, Tuple
 
+import requests
+import yt_dlp
 from youtube_transcript_api import (
     YouTubeTranscriptApi,
     TranscriptsDisabled,
@@ -37,11 +40,23 @@ PERMANENT_ERROR_TYPES = (
     NoTranscriptFound,
 )
 
+_YTDLP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+_VTT_TS = re.compile(
+    r"(\d{2}):(\d{2}):(\d{2})[.,](\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})[.,](\d{3})"
+)
+
 
 def format_timestamp(seconds: float) -> str:
     """
     Format a floating-point seconds value into [HH:MM:SS] or [MM:SS].
-    
+
     Examples:
         format_timestamp(75.0) -> "[01:15]"
         format_timestamp(3665.0) -> "[01:01:05]"
@@ -58,20 +73,16 @@ def format_timestamp(seconds: float) -> str:
 def normalize_text(text: str) -> str:
     """
     Normalize text artifacts without altering the speaker's original words.
-    
+
     - Decodes HTML entities (&amp; &#39; &quot;)
-    - Normalizes non-breaking spaces (\xa0) and control characters
+    - Normalizes non-breaking spaces (\\xa0) and control characters
     - Collapses multiple redundant spaces into a single space
     """
     if not text:
         return ""
-    # Unescape HTML entities
     unescaped = html.unescape(text)
-    # Replace non-breaking spaces and zero-width spaces
     unescaped = unescaped.replace("\xa0", " ").replace("\u200b", "").replace("\ufeff", "")
-    # Remove control characters except standard whitespace
     cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", unescaped)
-    # Collapse multiple spaces and trim
     cleaned = re.sub(r"[ \t]+", " ", cleaned).strip()
     return cleaned
 
@@ -99,7 +110,7 @@ def pick_best_transcript(
     if not preferred:
         preferred = ["en", "hi"]
     allow_any = "auto" in preferred
-    
+
     all_transcripts: List[Transcript] = list(transcript_list)
     if not all_transcripts:
         return None, "No transcripts available"
@@ -107,13 +118,11 @@ def pick_best_transcript(
     # Step 1 & 2: Direct match in priority order
     if not allow_any:
         for pref in preferred:
-            # Check manual match first
             for t in all_transcripts:
                 if not t.is_generated:
                     t_lang = (t.language_code or "").lower()
                     if t_lang == pref or t_lang.startswith(f"{pref}-"):
                         return t, t.language or t.language_code
-            # Check generated match
             for t in all_transcripts:
                 if t.is_generated:
                     t_lang = (t.language_code or "").lower()
@@ -165,12 +174,9 @@ def compile_full_text(segments: List[TranscriptSegment]) -> str:
         clean = seg.text.strip()
         if not clean:
             continue
-        
-        # If there's a significant pause (> 3.5 seconds) between segments, break paragraph
         if current_para and (seg.start - last_end) > 3.5:
             paragraphs.append(" ".join(current_para))
             current_para = []
-
         current_para.append(clean)
         last_end = seg.start + seg.duration
 
@@ -180,8 +186,123 @@ def compile_full_text(segments: List[TranscriptSegment]) -> str:
     return "\n\n".join(paragraphs)
 
 
+# --------------------------------------------------------------------------- #
+# yt-dlp caption extraction helpers
+#
+# youtube-transcript-api talks to one YouTube endpoint; yt-dlp rotates through
+# several player clients (web, tv, ios, android, ...). When the API is blocked,
+# trying yt-dlp's caption tracks often succeeds because the rate-limit buckets
+# differ per client. This is also the only path that can use a cookie file.
+# --------------------------------------------------------------------------- #
+
+def parse_json3_captions(payload: dict) -> List[TranscriptSegment]:
+    """Parse a YouTube ``json3`` caption payload into segments."""
+    segments: List[TranscriptSegment] = []
+    for event in payload.get("events", []):
+        text = normalize_text("".join(seg.get("utf8", "") for seg in event.get("segs", [])))
+        if not text:
+            continue
+        segments.append(
+            TranscriptSegment(
+                text=text,
+                start=float(event.get("tStartMs", 0)) / 1000.0,
+                duration=float(event.get("dDurationMs", 0)) / 1000.0,
+            )
+        )
+    return segments
+
+
+def parse_vtt_captions(text: str) -> List[TranscriptSegment]:
+    """Parse a WebVTT caption document into segments."""
+    def _to_seconds(h: str, m: str, s: str, ms: str) -> float:
+        return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000.0
+
+    segments: List[TranscriptSegment] = []
+    start: Optional[float] = None
+    end: Optional[float] = None
+    buffer: List[str] = []
+
+    def flush() -> None:
+        nonlocal start, end, buffer
+        if start is not None:
+            joined = normalize_text(" ".join(buffer))
+            if joined:
+                segments.append(
+                    TranscriptSegment(text=joined, start=start, duration=max(0.0, (end or start) - start))
+                )
+        start = end = None
+        buffer = []
+
+    for line in text.splitlines():
+        match = _VTT_TS.search(line)
+        if match:
+            flush()
+            start = _to_seconds(*match.groups()[:4])
+            end = _to_seconds(*match.groups()[4:])
+        elif start is not None:
+            if not line.strip():
+                flush()
+            else:
+                buffer.append(line.strip())
+    flush()
+    return segments
+
+
+def _lang_match(tracks: dict, langs: List[str]) -> Tuple[Optional[str], Optional[list]]:
+    for lang in langs:
+        for key, value in tracks.items():
+            k = key.lower()
+            if k == lang or k.startswith(f"{lang}-"):
+                return key, value
+    return None, None
+
+
+def choose_caption_track(
+    manual: dict,
+    automatic: dict,
+    preferred_languages: Iterable[str],
+) -> Tuple[Optional[str], Optional[list], Optional[bool]]:
+    """Choose the best caption track from yt-dlp's subtitle/auto-caption maps.
+
+    Returns ``(language_code, track_list, is_generated)`` or ``(None, None, None)``.
+    """
+    preferred = [lang.strip().lower() for lang in preferred_languages if lang.strip()]
+    auto_mode = "auto" in preferred
+
+    if not auto_mode:
+        for lang in preferred:
+            key, value = _lang_match(manual, [lang])
+            if key:
+                return key, value, False
+            key, value = _lang_match(automatic, [lang])
+            if key:
+                return key, value, True
+
+    if manual:
+        key = next(iter(manual))
+        return key, manual[key], False
+    if automatic:
+        key = next(iter(automatic))
+        return key, automatic[key], True
+    return None, None, None
+
+
+def pick_caption_url(tracks: list) -> Tuple[Optional[str], Optional[str]]:
+    """Pick a caption URL and its format, preferring machine-friendly json3/vtt."""
+    for ext in ("json3", "vtt", "srv3", "srv1", "srv2"):
+        for track in tracks:
+            if track.get("ext") == ext and track.get("url"):
+                return track["url"], ext
+    return None, None
+
+
 class TranscriptFetcher:
-    """Retrieves transcripts with adaptive retries, cooldown recovery and translation."""
+    """Retrieves transcripts via youtube-transcript-api with a yt-dlp fallback.
+
+    Rate limiting is handled by failing fast: a 429 against one client is very
+    likely a 429 against all of them, so we try the alternate client once, then
+    trip a short shared cooldown and give up on that video instead of grinding.
+    """
 
     def __init__(
         self,
@@ -191,6 +312,8 @@ class TranscriptFetcher:
         api: Optional[YouTubeTranscriptApi] = None,
         network_manager: Optional[NetworkManager] = None,
         allow_translation: bool = DEFAULT_CONFIG.allow_auto_translation,
+        use_ytdlp_fallback: bool = True,
+        cookie_file: Optional[str] = None,
     ):
         self.max_retries = max_retries
         self.initial_backoff = initial_backoff
@@ -198,11 +321,129 @@ class TranscriptFetcher:
         self.network_manager = network_manager or NetworkManager()
         self._custom_api = api
         self.allow_translation = allow_translation
+        self.use_ytdlp_fallback = use_ytdlp_fallback
+        self.cookie_file = cookie_file
 
     def _get_api(self) -> YouTubeTranscriptApi:
         if self._custom_api is not None:
             return self._custom_api
         return self.network_manager.create_transcript_api()
+
+    # ------------------------------------------------------------------ #
+    # yt-dlp fallback
+    # ------------------------------------------------------------------ #
+
+    def _extract_caption_info(self, video_id: str) -> Optional[dict]:
+        opts = {
+            "skip_download": True,
+            "quiet": True,
+            "no_warnings": True,
+            "ignoreerrors": False,
+            "socket_timeout": DEFAULT_CONFIG.transcript_timeout_seconds,
+        }
+        if self.cookie_file:
+            opts["cookiefile"] = self.cookie_file
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+
+    def fetch_via_ytdlp(
+        self,
+        video: VideoMetadata,
+        preferred_languages: List[str],
+    ) -> Optional[VideoTranscript]:
+        """Attempt to fetch a transcript through yt-dlp's caption tracks.
+
+        Returns a :class:`VideoTranscript`, or ``None`` when the method cannot
+        determine an outcome (caller then decides what to do).
+        """
+        try:
+            info = self._extract_caption_info(video.video_id)
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc).lower()
+            if "429" in msg or "too many requests" in msg:
+                return self._rate_limited_result(video)
+            logger.debug("yt-dlp fallback failed for %s: %s", video.video_id, exc)
+            return None
+
+        if not info:
+            return None
+
+        manual = info.get("subtitles") or {}
+        automatic = info.get("automatic_captions") or {}
+        lang, tracks, is_generated = choose_caption_track(manual, automatic, preferred_languages)
+
+        if not tracks:
+            return VideoTranscript(
+                video_id=video.video_id,
+                title=video.title,
+                url=video.url,
+                playlist_index=video.playlist_index,
+                status="failed",
+                error_code="no_captions",
+                error_reason="No captions found for the requested language(s).",
+                retrieved_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            )
+
+        url, ext = pick_caption_url(tracks)
+        if not url:
+            return None
+
+        try:
+            resp = requests.get(url, headers=_YTDLP_HEADERS, timeout=DEFAULT_CONFIG.transcript_timeout_seconds)
+            if resp.status_code == 429:
+                return self._rate_limited_result(video)
+            resp.raise_for_status()
+        except requests.HTTPError:
+            return self._rate_limited_result(video) if resp.status_code == 429 else None
+        except requests.RequestException as exc:
+            logger.debug("Caption URL fetch failed for %s: %s", video.video_id, exc)
+            return None
+
+        try:
+            segments = (
+                parse_json3_captions(resp.json())
+                if ext == "json3"
+                else parse_vtt_captions(resp.text)
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Caption parse failed for %s (%s): %s", video.video_id, ext, exc)
+            return None
+
+        full_text = compile_full_text(segments)
+        if not segments or not full_text.strip():
+            return VideoTranscript(
+                video_id=video.video_id,
+                title=video.title,
+                url=video.url,
+                playlist_index=video.playlist_index,
+                status="failed",
+                language=lang,
+                language_code=lang,
+                is_generated=is_generated,
+                error_code="empty_captions",
+                error_reason="No readable spoken text in captions",
+                retrieved_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            )
+
+        label = f"{lang} (auto-generated)" if is_generated else lang
+        logger.info("Retrieved transcript for %s via yt-dlp fallback.", video.video_id)
+        return VideoTranscript(
+            video_id=video.video_id,
+            title=video.title,
+            url=video.url,
+            playlist_index=video.playlist_index,
+            status="success",
+            language=label,
+            language_code=lang,
+            is_generated=is_generated,
+            segments=segments,
+            full_text=full_text,
+            retrieved_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        )
+
+    # ------------------------------------------------------------------ #
+    # Main entry point
+    # ------------------------------------------------------------------ #
 
     def fetch_video_transcript(
         self,
@@ -214,21 +455,18 @@ class TranscriptFetcher:
 
         Strategy
         --------
-        1. Respect the shared circuit breaker: if another worker detected rate
-           limiting, wait out the cooldown before attempting anything.
-        2. Attempt the fetch. Permanent errors (captions disabled, video private)
-           return immediately.
-        3. On rate-limit signals (``RequestBlocked`` / ``IpBlocked``) trip the
-           shared cooldown so *all* workers pause, then retry a bounded number of
-           times. This is the polite response — never hammer, never rotate IPs.
-        4. On generic transient errors, back off exponentially with jitter.
+        1. Respect the shared circuit breaker (another worker found rate limiting).
+        2. Try youtube-transcript-api. Permanent errors return immediately.
+        3. On a rate-limit signal, try the yt-dlp fallback once (different client).
+        4. If both are blocked, trip a short shared cooldown and return a
+           ``rate_limited`` failure so the job can stop instead of grinding.
+        5. On generic transient errors, back off exponentially with jitter.
         """
         langs = preferred_languages or DEFAULT_CONFIG.default_languages
         retries = 0
         backoff = self.initial_backoff
 
         while True:
-            # Respect circuit breaker set by another worker.
             if self.network_manager.circuit_breaker.is_tripped:
                 logger.info("Rate-limit cooldown active, waiting before video %s...", video.video_id)
                 resumed = self.network_manager.circuit_breaker.wait_if_tripped(stop_event=stop_event)
@@ -243,8 +481,7 @@ class TranscriptFetcher:
                     )
 
             try:
-                api = self._get_api()
-                transcript = self._do_fetch(video, langs, api)
+                transcript = self._do_fetch(video, langs, self._get_api())
                 return transcript
 
             except PERMANENT_ERROR_TYPES as exc:
@@ -256,52 +493,27 @@ class TranscriptFetcher:
                     url=video.url,
                     playlist_index=video.playlist_index,
                     status="failed",
+                    error_code="captions_unavailable",
                     error_reason=reason,
                     retrieved_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 )
 
             except (RequestBlocked, IpBlocked):
-                retries += 1
-                if retries > self.max_retries:
-                    logger.warning(
-                        "Still rate limited after %d attempts for video %s — giving up.",
-                        retries,
-                        video.video_id,
-                    )
-                    return VideoTranscript(
-                        video_id=video.video_id,
-                        title=video.title,
-                        url=video.url,
-                        playlist_index=video.playlist_index,
-                        status="failed",
-                        error_reason=(
-                            "YouTube rate-limited this request (HTTP 429). "
-                            "Add your browser cookies in Settings, lower the concurrency, "
-                            "and try again in a few minutes. Already-downloaded videos are cached."
-                        ),
-                        retrieved_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                    )
+                # Different YouTube client — often a different rate-limit bucket.
+                if self.use_ytdlp_fallback:
+                    fallback = self.fetch_via_ytdlp(video, langs)
+                    if fallback is not None and fallback.error_code != "rate_limited":
+                        return fallback
 
-                cooldown = min(backoff * self.backoff_factor, 60.0)
-                logger.warning(
-                    "Rate limited on video %s (attempt %d/%d) — pausing workers for %.0fs",
-                    video.video_id,
-                    retries,
-                    self.max_retries,
-                    cooldown,
-                )
-                # Trip the shared breaker so every worker pauses together.
                 self.network_manager.circuit_breaker.trip(
-                    cooldown_seconds=cooldown,
+                    cooldown_seconds=DEFAULT_CONFIG.rate_limit_cooldown_seconds,
                     reason="YouTube rate limit (HTTP 429)",
                 )
-                backoff = cooldown
-                continue
+                return self._rate_limited_result(video)
 
             except Exception as exc:
                 retries += 1
                 reason = self._format_error(exc)
-
                 if retries > self.max_retries:
                     logger.warning("Max retries exceeded for video %s: %s", video.video_id, reason)
                     return VideoTranscript(
@@ -310,21 +522,34 @@ class TranscriptFetcher:
                         url=video.url,
                         playlist_index=video.playlist_index,
                         status="failed",
+                        error_code="error",
                         error_reason=f"Failed after {retries} attempts: {reason}",
                         retrieved_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
                     )
-
                 sleep_time = backoff + random.uniform(0.3, 1.0)
                 logger.info(
                     "Transient error for video %s (attempt %d/%d): %s — backing off %.2fs",
-                    video.video_id,
-                    retries,
-                    self.max_retries,
-                    reason,
-                    sleep_time,
+                    video.video_id, retries, self.max_retries, reason, sleep_time,
                 )
                 time.sleep(sleep_time)
                 backoff = min(backoff * self.backoff_factor, 30.0)
+
+    def _rate_limited_result(self, video: VideoMetadata) -> VideoTranscript:
+        return VideoTranscript(
+            video_id=video.video_id,
+            title=video.title,
+            url=video.url,
+            playlist_index=video.playlist_index,
+            status="failed",
+            error_code="rate_limited",
+            error_reason=(
+                "YouTube is rate-limiting this IP (HTTP 429). This is usually the "
+                "server's network, not your input. Wait a few minutes and retry, lower "
+                "the parallel workers, or run the app locally where your own connection "
+                "and cookies are used."
+            ),
+            retrieved_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        )
 
     def _do_fetch(
         self,
@@ -339,7 +564,7 @@ class TranscriptFetcher:
             preferred_languages,
             allow_translation=self.allow_translation,
         )
-        
+
         if not chosen:
             raise NoTranscriptFound(
                 video_id=video.video_id,
@@ -349,7 +574,7 @@ class TranscriptFetcher:
 
         fetched = chosen.fetch()
         raw_items = fetched.to_raw_data()
-        
+
         segments: List[TranscriptSegment] = []
         for item in raw_items:
             clean_text = normalize_text(item.get("text", ""))
@@ -364,7 +589,6 @@ class TranscriptFetcher:
 
         full_text = compile_full_text(segments)
 
-        # Requirement: Never mark a transcript successful when its content is missing or incomplete
         if not segments or not full_text.strip():
             return VideoTranscript(
                 video_id=video.video_id,
@@ -375,6 +599,7 @@ class TranscriptFetcher:
                 language=lang_label,
                 language_code=chosen.language_code,
                 is_generated=chosen.is_generated,
+                error_code="empty_captions",
                 error_reason="No readable spoken text in captions",
                 retrieved_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
             )

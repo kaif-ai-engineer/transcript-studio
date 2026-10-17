@@ -146,10 +146,16 @@ class JobManager:
                 fut = executor.submit(fetch_single, v)
                 future_to_video[fut] = v
 
+            consecutive_rate_limits = 0
+            aborted_for_rate_limit = False
+
             for future in concurrent.futures.as_completed(future_to_video):
                 v_meta = future_to_video[future]
                 if stop_event and stop_event.is_set():
                     progress.is_cancelled = True
+                    continue
+                if future.cancelled():
+                    # Job aborted (e.g. rate limited) before this video started.
                     continue
 
                 try:
@@ -174,15 +180,32 @@ class JobManager:
 
                     if transcript.is_successful():
                         progress.successful += 1
+                        consecutive_rate_limits = 0
                         msg = f"✓ [{transcript.playlist_index}/{playlist.total_count}] {transcript.title[:50]} ({transcript.language})"
                     elif transcript.status == "skipped":
                         progress.skipped += 1
                         msg = f"- [{transcript.playlist_index}/{playlist.total_count}] Skipped: {transcript.title[:50]}"
+                    elif transcript.error_code == "rate_limited":
+                        progress.failed += 1
+                        consecutive_rate_limits += 1
+                        msg = f"⚠ [{transcript.playlist_index}/{playlist.total_count}] Rate limited: {transcript.title[:50]}"
                     else:
                         progress.failed += 1
                         msg = f"✗ [{transcript.playlist_index}/{playlist.total_count}] {transcript.title[:50]} - {transcript.error_reason}"
 
                     progress.logs.append(msg)
+                    trip = consecutive_rate_limits >= DEFAULT_CONFIG.abort_job_after_rate_limits
+                    if trip and not aborted_for_rate_limit:
+                        aborted_for_rate_limit = True
+
+                if trip:
+                    progress.rate_limited = True
+                    progress.logs.append(
+                        "YouTube is rate-limiting this server. Stopping to avoid wasting time — "
+                        "retry the remaining videos in a few minutes, or run locally."
+                    )
+                    for pending in future_to_video:
+                        pending.cancel()
 
                 if progress_callback:
                     progress_callback(progress, transcript)
