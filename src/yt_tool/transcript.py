@@ -87,6 +87,17 @@ def normalize_text(text: str) -> str:
     return cleaned
 
 
+def _language_label(name: Optional[str], is_generated: bool) -> str:
+    """Build a human-readable language label without duplicating the suffix.
+
+    ``youtube-transcript-api`` already reports auto-generated tracks as
+    ``"English (auto-generated)"``, so we strip any existing suffix before
+    appending our own.
+    """
+    base = re.sub(r"\s*\(auto-generated\)\s*$", "", (name or "").strip(), flags=re.IGNORECASE).strip()
+    return f"{base} (auto-generated)" if is_generated else base
+
+
 def pick_best_transcript(
     transcript_list: TranscriptList,
     preferred_languages: Iterable[str],
@@ -127,7 +138,7 @@ def pick_best_transcript(
                 if t.is_generated:
                     t_lang = (t.language_code or "").lower()
                     if t_lang == pref or t_lang.startswith(f"{pref}-"):
-                        return t, f"{t.language or t.language_code} (auto-generated)"
+                        return t, _language_label(t.language or t.language_code, True)
 
     # Step 3: Auto-translation to preferred language (e.g. Bengali -> English or Hindi)
     if not allow_any and allow_translation:
@@ -146,12 +157,12 @@ def pick_best_transcript(
     # Step 4: Fallback to any manual transcript
     for t in all_transcripts:
         if not t.is_generated:
-            return t, f"{t.language or t.language_code} (original manual)"
+            return t, f"{_language_label(t.language or t.language_code, False)} (original manual)"
 
     # Step 5: Fallback to any generated transcript
     for t in all_transcripts:
         if t.is_generated:
-            return t, f"{t.language or t.language_code} (auto-generated)"
+            return t, _language_label(t.language or t.language_code, True)
 
     # Final fallback
     t = all_transcripts[0]
@@ -425,7 +436,7 @@ class TranscriptFetcher:
                 retrieved_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
             )
 
-        label = f"{lang} (auto-generated)" if is_generated else lang
+        label = _language_label(lang, bool(is_generated))
         logger.info("Retrieved transcript for %s via yt-dlp fallback.", video.video_id)
         return VideoTranscript(
             video_id=video.video_id,

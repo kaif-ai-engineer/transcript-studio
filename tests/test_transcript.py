@@ -376,6 +376,24 @@ def test_fetch_rate_limit_fails_when_fallback_also_blocked(mocker):
     assert cb.is_tripped
 
 
+def test_language_label_does_not_duplicate_suffix():
+    """Auto-generated tracks must not read 'English (auto-generated) (auto-generated)'."""
+    from yt_tool.transcript import _language_label
+
+    assert _language_label("English (auto-generated)", True) == "English (auto-generated)"
+    assert _language_label("English", True) == "English (auto-generated)"
+    assert _language_label("English (auto-generated)", False) == "English"
+    assert _language_label("en", True) == "en (auto-generated)"
+
+
+def test_pick_best_transcript_no_duplicate_generated_suffix():
+    """The library already labels auto tracks; selection must not append again."""
+    t_gen = MagicMock(language_code="en", language="English (auto-generated)", is_generated=True)
+    chosen, desc = pick_best_transcript([t_gen], ["en"])
+    assert chosen == t_gen
+    assert desc == "English (auto-generated)"
+
+
 def test_parse_json3_captions():
     """json3 caption payloads are converted to timed segments."""
     from yt_tool.transcript import parse_json3_captions
