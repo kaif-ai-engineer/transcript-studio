@@ -1,0 +1,191 @@
+"""Network layer: polite HTTP sessions, browser-cookie auth, and rate-limit recovery.
+
+This module intentionally favours the *legitimate* path for talking to YouTube:
+
+* A small pool of realistic browser user-agents and headers.
+* Optional browser cookies (Netscape file or raw ``Cookie:`` string), which is the
+  single most effective way to avoid anonymous-IP rate limiting.
+* Bounded retries for transient HTTP failures on the direct connection.
+* A shared :class:`CircuitBreaker` that pauses every worker when YouTube signals
+  that we are sending requests too quickly (HTTP 429 / ``RequestBlocked``).
+
+Proxy rotation, IP masking, and Tor exit-node hopping are intentionally **not**
+implemented. Those techniques circumvent YouTube's access controls, violate the
+YouTube Terms of Service, and are unreliable in practice (public proxies are
+almost always blocked or dead). See the README "Legal & Acceptable Use" section.
+"""
+
+from __future__ import annotations
+
+import http.cookiejar
+import logging
+import random
+import threading
+import time
+from pathlib import Path
+from typing import Optional
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from youtube_transcript_api import YouTubeTranscriptApi
+
+logger = logging.getLogger(__name__)
+
+# Realistic desktop user-agents so requests look like a normal browser.
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.4; rv:125.0) Gecko/20100101 Firefox/125.0",
+]
+
+_BASE_HEADERS = {
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+}
+
+
+class CircuitBreaker:
+    """Thread-safe circuit breaker that pauses outgoing requests when rate limiting is detected.
+
+    When any worker sees a rate-limit signal it trips the breaker. Every other worker
+    checks :attr:`is_tripped` before each attempt and waits it out, which keeps the
+    whole job polite instead of hammering YouTube with parallel retries.
+    """
+
+    def __init__(self, default_cooldown: float = 25.0):
+        self.default_cooldown = default_cooldown
+        self._lock = threading.RLock()
+        self._cooldown_until: float = 0.0
+        self._reason: str = ""
+
+    @property
+    def is_tripped(self) -> bool:
+        with self._lock:
+            return time.time() < self._cooldown_until
+
+    @property
+    def reason(self) -> str:
+        with self._lock:
+            return self._reason
+
+    def trip(self, cooldown_seconds: Optional[float] = None, reason: str = "") -> None:
+        """Trip the circuit breaker to pause all workers."""
+        duration = cooldown_seconds if cooldown_seconds is not None else self.default_cooldown
+        with self._lock:
+            # Never shorten an in-flight cooldown triggered by another worker.
+            self._cooldown_until = max(self._cooldown_until, time.time() + duration)
+            self._reason = reason or "Rate limiting detected"
+            logger.warning(
+                "Circuit breaker tripped: %s. Pausing workers for %.1fs",
+                self._reason,
+                duration,
+            )
+
+    def reset(self) -> None:
+        """Manually reset the circuit breaker."""
+        with self._lock:
+            self._cooldown_until = 0.0
+            self._reason = ""
+
+    def wait_if_tripped(self, stop_event: Optional[threading.Event] = None) -> bool:
+        """Block while the circuit breaker is tripped.
+
+        Returns ``False`` if interrupted by ``stop_event``, ``True`` otherwise.
+        """
+        while True:
+            with self._lock:
+                remaining = self._cooldown_until - time.time()
+            if remaining <= 0:
+                return True
+            if stop_event and stop_event.is_set():
+                return False
+            time.sleep(min(1.0, max(0.1, remaining)))
+
+
+def _make_adapter() -> HTTPAdapter:
+    """Return an HTTPAdapter with a sensible retry policy for transient errors."""
+    retry = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["GET", "HEAD"],
+        raise_on_status=False,
+    )
+    return HTTPAdapter(max_retries=retry)
+
+
+class NetworkManager:
+    """Builds polite HTTP sessions and transcript API clients.
+
+    Parameters
+    ----------
+    cookie_string:
+        A raw browser ``Cookie:`` header value (e.g. ``VISITOR_INFO1_LIVE=...``).
+        Passing real cookies is the recommended way to avoid rate limiting.
+    cookies_file:
+        Optional Netscape-format cookie file (e.g. exported with a browser plugin).
+    circuit_breaker:
+        Shared breaker used to coordinate cooldowns across worker threads.
+    """
+
+    def __init__(
+        self,
+        cookie_string: Optional[str] = None,
+        cookies_file: Optional[Path] = None,
+        circuit_breaker: Optional[CircuitBreaker] = None,
+    ):
+        self.cookie_string = cookie_string
+        self.cookies_file = Path(cookies_file) if cookies_file else None
+        self.circuit_breaker = circuit_breaker or CircuitBreaker()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _apply_cookies(self, session: requests.Session) -> None:
+        """Inject cookies from a file and/or a raw cookie string into a session."""
+        if self.cookies_file and self.cookies_file.exists():
+            try:
+                jar = http.cookiejar.MozillaCookieJar(str(self.cookies_file))
+                jar.load(ignore_discard=True, ignore_expires=True)
+                for cookie in jar:
+                    session.cookies.set(cookie.name, cookie.value, domain=".youtube.com")
+                logger.debug("Loaded cookies from %s", self.cookies_file)
+            except Exception as exc:
+                logger.warning("Failed loading cookies from %s: %s", self.cookies_file, exc)
+
+        if self.cookie_string and self.cookie_string.strip():
+            for item in self.cookie_string.strip().split(";"):
+                if "=" in item:
+                    key, value = item.strip().split("=", 1)
+                    if key.strip():
+                        session.cookies.set(key.strip(), value.strip(), domain=".youtube.com")
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def build_session(self) -> requests.Session:
+        """Create a polite :class:`requests.Session` with headers, cookies and retries."""
+        session = requests.Session()
+        session.headers.update({"User-Agent": random.choice(USER_AGENTS), **_BASE_HEADERS})
+        self._apply_cookies(session)
+
+        adapter = _make_adapter()
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        return session
+
+    def create_transcript_api(self) -> YouTubeTranscriptApi:
+        """Create a ``YouTubeTranscriptApi`` bound to a fresh, polite session.
+
+        A new instance is created per attempt, which keeps each worker thread's
+        session independent (the library's sessions are not thread-safe).
+        """
+        return YouTubeTranscriptApi(http_client=self.build_session())

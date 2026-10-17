@@ -1,0 +1,52 @@
+{
+  "playlist_id": "PL1234567890abcdef",
+  "playlist_title": "Deep Learning & Neural Networks Lecture Series",
+  "playlist_url": "https://www.youtube.com/playlist?list=PL1234567890abcdef",
+  "total_videos": 3,
+  "successful_count": 2,
+  "failed_count": 1,
+  "videos": [
+    {
+      "playlist_index": 1,
+      "video_id": "vid001lecture",
+      "title": "Lecture 1: Introduction to Gradient Descent",
+      "url": "https://www.youtube.com/watch?v=vid001lecture",
+      "status": "success",
+      "language": "English (auto-generated)",
+      "language_code": "en",
+      "is_generated": true,
+      "segment_count": 142,
+      "character_count": 8920,
+      "error_reason": null,
+      "retrieved_at": "2026-10-11T16:00:00Z"
+    },
+    {
+      "playlist_index": 2,
+      "video_id": "vid002backprop",
+      "title": "Lecture 2: Mathematical Foundations of Backpropagation",
+      "url": "https://www.youtube.com/watch?v=vid002backprop",
+      "status": "success",
+      "language": "English",
+      "language_code": "en",
+      "is_generated": false,
+      "segment_count": 210,
+      "character_count": 13450,
+      "error_reason": null,
+      "retrieved_at": "2026-10-11T16:05:00Z"
+    },
+    {
+      "playlist_index": 3,
+      "video_id": "vid003private",
+      "title": "Lecture 3: Advanced Optimization Lab",
+      "url": "https://www.youtube.com/watch?v=vid003private",
+      "status": "failed",
+      "language": null,
+      "language_code": null,
+      "is_generated": null,
+      "segment_count": 0,
+      "character_count": 0,
+      "error_reason": "Captions are disabled for this video.",
+      "retrieved_at": "2026-10-11T16:08:00Z"
+    }
+  ]
+}
